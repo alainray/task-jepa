@@ -70,9 +70,6 @@ def update_meters(args, loss, output, expected_output, all_meters):
                     preds = output[i].argmax(dim=1)
                     y = expected_output[:,idx]
                     correct = (preds == y).float().sum()
-                    print(preds.shape, y.shape)
-                    print("corr", correct)
-                    print("numel", y.numel())
                     total = y.numel()
                     acc = correct/total
                     val = acc 

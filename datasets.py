@@ -5,17 +5,22 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split, Subset
 from easydict import EasyDict as edict
 
-def _load_shapes3d(data_dir):
+def _load_shapes3d(data_dir, test=False):
     transform = transforms.Compose([
         transforms.Normalize((0.5028, 0.5788, 0.6033),
                              (0.3492, 0.4011, 0.4213)),
     ])
     split = 'abstraction'
-    trainset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_train_images.npz',
-                               f'{data_dir}/shapes3d_{split}_train_labels.npz',
+    if test:
+        subsample = "_subsample"
+    else:
+        subsample = ""
+
+    trainset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_train_images{subsample}.npz',
+                               f'{data_dir}/shapes3d_{split}_train_labels{subsample}.npz',
                                transform=transform)
-    testset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_test_images.npz',
-                              f'{data_dir}/shapes3d_{split}_test_labels.npz',
+    testset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_test_images{subsample}.npz',
+                              f'{data_dir}/shapes3d_{split}_test_labels{subsample}.npz',
                               transform=transform)
     return trainset, testset
 
@@ -114,7 +119,7 @@ class Shapes3DDataset:
 
 def get_dataloaders(args):
     #data_dir = "/mnt/nas2/GrimaRepo/fidelrio/gradient_based_inference_on_mnist/data/shapes3d"
-    a  =_load_shapes3d(args.data_dir)
+    a  =_load_shapes3d(args.data_dir, test=args.test)
     #a  =_load_mpi3d(data_dir)
     ds = {'train': a[0], 'test': a[1]}
     # Define the train-validation split ratio

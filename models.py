@@ -13,7 +13,7 @@ class ConvStemConfig(NamedTuple):
     stride: int
     norm_layer: Callable[..., nn.Module] = nn.BatchNorm2d
     activation_layer: Callable[..., nn.Module] = nn.ReLU
-# It assumes a pair of images concatenated along the height dimension
+# It assumes a pair of images concatenated along the sequence dimension
 
 class PairVisionTransformer(VisionTransformer):
     def __init__(
@@ -92,6 +92,39 @@ class PairVisionTransformer(VisionTransformer):
         x = self.heads(x)
 
         return x
+
+class SimpleConvModel(nn.Module):
+    def __init__(self):
+        super(SimpleConvModel, self).__init__()
+        
+        # Convolutional layers
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)  # Input: 64x64x3, Output: 64x64x32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1) # Input: 64x64x32, Output: 64x64x64
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1) # Input: 64x64x64, Output: 32x32x128
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1) # Input: 32x32x128, Output: 16x16x256
+        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1) # Input: 16x16x256, Output: 8x8x512
+        self.conv6 = nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1) # Input: 8x8x512, Output: 4x4x512
+        
+        # Fully connected layer
+        self.fc = nn.Linear(4 * 4 * 512, 384)  # Flatten from 4x4x512 to 384 output
+        
+    def forward(self, x):
+        # Pass through convolutional layers with ReLU activations
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
+        x = F.relu(self.conv5(x))
+        x = F.relu(self.conv6(x))
+        
+        # Flatten the tensor
+        x = x.view(x.size(0), -1)  # Flatten to (batch_size, 4*4*512)
+        
+        # Fully connected layer to output the final 384-dimensional vector
+        x = self.fc(x)
+        
+        return x
+
 
 class LatentVisionTransformer(VisionTransformer):
     def __init__(
@@ -257,6 +290,8 @@ def create_model(args):
                 encoder.heads = nn.Identity()
                 # load weights
                 # turn off weights if required
+            elif args.encoder['arch'] == "cnn":
+                encoder = SimpleConvModel()
             if args.encoder['frozen']:
                 for p in encoder.parameters():
                     p.requires_grad = False

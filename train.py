@@ -24,19 +24,25 @@ def step_encoder_erm(args, models, x, y, criterion, optimizer, train=True):
     
     bs, *_ = x[0].shape
     
-    x = torch.cat([x[0] , x[1]], dim=0) # concatenate along batch dimension for efficiency
+    #x = torch.cat([x[0] , x[1]], dim=0) # concatenate along batch dimension for efficiency
     
-    features = encoder(x) 
-    x_1 = features[:bs]
-    x_2 = features[bs:]
-    print(x_1.shape, x_2.shape)
+    #features = encoder(x) 
+    #x_1 = features[:bs]
+    #x_2 = features[bs:]
+    x_1 = encoder(x[0])
+    x_2 = encoder(x[1])
+    #print(x_1.shape, x_2.shape)
+    #print(x_1[:32,0])
+    #print(x_2[:32,0])
     features = torch.cat([x_1, x_2], dim=-1)
-    print(features.shape)
+    #print(features.shape)
     output = predictor(features)
+    
+    
     loss = []
     # decompose loss per task
     for i, fov in enumerate(args.fovs_tasks):
-        print(output[i].shape, y[:,i].shape)
+        #print(output[i].shape, y[:,i].shape)
         loss.append(criterion(output[i], y[:,i]))
 
     loss = torch.stack(loss)
@@ -47,20 +53,28 @@ def step_encoder_erm(args, models, x, y, criterion, optimizer, train=True):
     if train:
         optimizer.zero_grad()
         avg_loss.backward()       # Backprop
-        '''for name, p in predictor.named_parameters():
+        for name, p in predictor.named_parameters():
             print(name)
-            print("data",p.data)
-            print("grad",p.grad.data)
+            #print("data",p.data)
+            print("pred grad",p.grad.data[0])
+            print(p.requires_grad)
+        '''
+        for name, p in encoder.named_parameters():
+            print(name)
+            #print("data",p.data)
+            print("enc grad",p.grad.data[0])
             print(p.requires_grad)'''
+
         optimizer.step()      # Update Parameters
     
     return (encoder, predictor), [l.detach().cpu() for l in loss], [o.detach().cpu() for o in output]
 
 
+
 def step_pair_erm(args, models, x, y, criterion, optimizer, train=True):
     # models in encoder, target_encoder
     encoder = models[0] # target_encoder should have gradients set to off
-    x = torch.cat([x[0] , x[1]], dim=2)
+    x = torch.cat([x[0] , x[1]], dim=2) # concatenate data along sequence
     # model_device = next(target_encoder.parameters()).device
     # targets = target_encoder(x_target, latents_zeros)
     output = encoder(x) # concatenate along H dimension
@@ -102,6 +116,7 @@ def step_erm(args, model, x, y, criterion, optimizer, train=True):
     return model, loss.detach().cpu(), output.detach().cpu()
 
 def create_pairs(args, x, y):
+    print(y)
     # define pairs and labels for pairwise training
     n_fovs = y.shape[-1]
     # create all pairs of input and target
@@ -129,6 +144,9 @@ def create_pairs(args, x, y):
     # For dimensions [3, 5]: set values > 0 to 1 and values < 0 to 2
     latents_diff[:, [3, 5]] = torch.where(latents_diff[:, [3, 5]] > 0, torch.tensor(1), latents_diff[:, [3, 5]])
     latents_diff[:, [3, 5]] = torch.where(latents_diff[:, [3, 5]] < 0, torch.tensor(2), latents_diff[:, [3, 5]])
+
+    for i in range(6):
+        print(torch.unique(latents_diff[:,i], return_counts=True))
 
     latents_diff = latents_diff[:,args.fovs_ids].long()
     all_image_pairs = all_image_pairs.view(-1, 2, C, H, W)
@@ -196,7 +214,12 @@ def train(args, dls):
 
     best_model = models
     best_metrics = None
-    optimizer = AdamW(models[0].parameters(),lr=args.lr)
+    params = [
+                {'params': models[0].parameters()},
+                {'params': models[1].parameters()}
+            ]
+    #params = list(models[0].parameters()) + list(models[1].parameters())
+    optimizer = AdamW(params, lr=args.lr)
     criterion = get_criterion(args)
     # start W&B experiment
     all_metrics = {'train': [], 'val': [], 'test': []}
