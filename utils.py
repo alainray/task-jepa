@@ -1,6 +1,9 @@
 import torch
 import numpy as np
-
+from optim import CosineWDSchedule, WarmupCosineSchedule 
+from torch.optim import AdamW
+import os
+import pandas as pd 
 def set_seed(seed):
     """Sets seed"""
     if torch.cuda.is_available():
@@ -39,7 +42,13 @@ class AverageMeter:
         return f'Average: {self.avg:.4f} (Count: {self.count})'
 
 def get_exp_name(args):
-    return f"{args.dataset}_{args.train_method}_{args.seed}"
+    if "encoder" in args:
+        encoder = args.encoder.arch + "_"
+    if "experiment_id" in args:
+        experiment_id = "_" + args.experiment_id
+    else:
+        experiment_id = ""
+    return f"{args.dataset}_{args.train_method}_{encoder}{args.seed}{experiment_id}"
 
 def setup_meters(args):
     
@@ -54,7 +63,11 @@ def setup_meters(args):
             metrics[fov] = {metric: AverageMeter() for metric in args.metrics}
     else:
       
-        metrics = {"loss": AverageMeter()}
+        metrics = {
+         "rep_loss": AverageMeter(),
+         "rep_var_enc": AverageMeter(),
+         "rep_var_tgt": AverageMeter()
+         }
         
     return metrics
 
@@ -75,7 +88,11 @@ def update_meters(args, loss, output, expected_output, all_meters):
                     val = acc 
                 all_meters[fov][metric].update(val) # update task metric
     else:
-        all_meters["loss"].update(loss)
+        all_meters["rep_loss"].update(loss)
+        rep_variance1 = torch.var(output[0], dim=0).mean()
+        rep_variance2 = torch.var(output[1], dim=0).mean()
+        all_meters["rep_var_enc"].update(rep_variance1)
+        all_meters["rep_var_tgt"].update(rep_variance2)
     
     return all_meters
 
@@ -121,6 +138,8 @@ def format_metrics_wandb(metrics, split=""):
             full_metrics[name] = value
     return full_metrics
 
+
+
 def pprint_metrics(meter_dict):
 
     """Pretty prints a dictionary of AverageMeter objects."""
@@ -134,3 +153,88 @@ def pprint_metrics(meter_dict):
         else:
             print(f"  - Loss: Avg = {metrics.avg:.4f}")
         print()  # Add an empty line for better readability
+
+
+def init_opt(
+    args,
+    models
+):
+    if args.train_method in ['task_jepa', 'ijepa']:
+        encoder, target_encoder = models
+        param_groups = [
+        {
+            'params': (p for n, p in encoder.named_parameters()
+                       if ('bias' not in n) and (len(p.shape) != 1))
+        }, {
+            'params': (p for n, p in target_encoder.named_parameters()
+                       if ('bias' not in n) and (len(p.shape) != 1))
+        }, {
+            'params': (p for n, p in encoder.named_parameters()
+                       if ('bias' in n) or (len(p.shape) == 1)),
+            'WD_exclude': True,
+            'weight_decay': 0
+        }, {
+            'params': (p for n, p in target_encoder.named_parameters()
+                       if ('bias' in n) or (len(p.shape) == 1)),
+            'WD_exclude': True,
+            'weight_decay': 0
+        }
+    ]
+
+        optimizer = torch.optim.AdamW(param_groups)
+        scheduler = WarmupCosineSchedule(
+            optimizer,
+            warmup_steps=int(args.warmup*args.ipe),
+            start_lr=args.start_lr,
+            ref_lr=args.lr,
+            final_lr=args.final_lr,
+            T_max=int(args.ipe_scale*args.num_epochs*args.ipe))
+        wd_scheduler = CosineWDSchedule(
+            optimizer,
+            ref_wd=args.wd,
+            final_wd=args.final_wd,
+            T_max=int(args.ipe_scale*args.num_epochs*args.ipe))
+
+    else:
+        if args.train_method == "encoder_erm":
+            param_groups = [
+                {'params': models[0].parameters()},
+                {'params': models[1].parameters()}
+            ]
+        else:
+            param_groups = [
+                {'params': models[0].parameters()}
+            ]
+        optimizer = AdamW(param_groups, lr=args.lr, wd=args.wd)
+        scheduler = None
+        wd_scheduler = None
+
+    return optimizer, scheduler, wd_scheduler
+
+def save_model(args, models):
+    results = {}
+    for i, m in enumerate(models):
+        results[f'model_{i}'] = m.state_dict()
+    
+    # Construct the directory path
+    save_dir = f"models/{args.experiment_id}"
+    
+    # Create the directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save the models
+    save_path = f"{save_dir}/{args.epoch}.pth"
+    torch.save(results, save_path)
+    print(f"Model saved to {save_path}")
+
+def save_metrics(args, all_metrics):
+    # Convert list of dictionaries to a DataFrame
+    
+    # Construct the directory path
+    save_dir = f"results/{args.experiment_id}"
+    
+    # Create the directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    for k, v in all_metrics.items():
+        df = pd.DataFrame(v)
+        df.to_csv(f"{save_dir}/{k}_{args.epoch}.csv")

@@ -157,7 +157,7 @@ class LatentVisionTransformer(VisionTransformer):
             conv_stem_configs=conv_stem_configs,
         )
         self.latent_proj = nn.Linear(6, hidden_dim)
-        # Since we are adding a new token for the latent vector we need increase sequence length 
+        # Since we are adding a new token for the latent vector we need to increase sequence length 
         self.seq_length += 1
         self.encoder = Encoder(
             self.seq_length,
@@ -229,7 +229,7 @@ class MultiHeadClassifier(nn.Module):
     def __init__(self, input_dim=100, output_dims=[1]):
         super(MultiHeadClassifier, self).__init__()
         self.input_dim = input_dim
-        self.classifiers = nn.Linear(self.input_dim, sum(output_dims))
+        self.classifiers = nn.Sequential(nn.Linear(self.input_dim, 128),nn.ReLU(), nn.Linear(128, sum(output_dims)))
         self.output_dims = output_dims
 
     def forward(self, x):
@@ -301,7 +301,7 @@ def create_model(args):
         #predictor = MLPPredictor(input_dim=2*args.encoder['output_dim'], output_dims=output_dims)
         return encoder, predictor
         
-    elif "jepa" in args.train_method:
+    elif args.train_method in ['task_jepa', 'ijepa']:
         encoder = LatentVisionTransformer(
             image_size=64,
             patch_size=8,
@@ -313,7 +313,7 @@ def create_model(args):
         )
         mhc = nn.Identity()
         encoder.heads = mhc
-        target_encoder = copy.deepcopy(model)
+        target_encoder = copy.deepcopy(encoder)
         for p in target_encoder.parameters():
             p.requires_grad = False
         return encoder, target_encoder

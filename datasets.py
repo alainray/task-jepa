@@ -12,15 +12,17 @@ def _load_shapes3d(data_dir, test=False):
     ])
     split = 'abstraction'
     if test:
-        subsample = "_subsample"
+        subsample_train = "_subsample"
+        subsample_test = "_subsample"
     else:
-        subsample = ""
+        subsample_train = ""
+        subsample_test = "_subsample_for_evaluation_in_training" # we use 10% of test data to evaluate during training, then retest on the whole test set.
 
-    trainset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_train_images{subsample}.npz',
-                               f'{data_dir}/shapes3d_{split}_train_labels{subsample}.npz',
+    trainset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_train_images{subsample_train}.npz',
+                               f'{data_dir}/shapes3d_{split}_train_labels{subsample_train}.npz',
                                transform=transform)
-    testset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_test_images{subsample}.npz',
-                              f'{data_dir}/shapes3d_{split}_test_labels{subsample}.npz',
+    testset = Shapes3DDataset(f'{data_dir}/shapes3d_{split}_test_images{subsample_test}.npz',
+                              f'{data_dir}/shapes3d_{split}_test_labels{subsample_test}.npz',
                               transform=transform)
     return trainset, testset
 
@@ -142,5 +144,10 @@ def get_dataloaders(args):
             'pair_erm': {'train': 16, 'val': 32, 'test': 32},
             'encoder_erm': {'train': 16, 'val': 32, 'test': 32} 
          }
-    dls = {split : DataLoader(ds[split], batch_size = bs[args.train_method][split], shuffle=True) for split in ['train','val','test']}
+    dls = {split : DataLoader(ds[split],
+    num_workers=args.num_workers,
+    pin_memory=True,
+           batch_size = bs[args.train_method][split],
+            shuffle=True) 
+            for split in ['train','val','test']}
     return dls
