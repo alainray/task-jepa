@@ -11,6 +11,15 @@ parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs
 parser.add_argument('--train_method', type=str, choices=['erm','task_jepa',"pair_erm","encoder_erm"], default="erm", help='Training Method')
 parser.add_argument('--dataset', type=str, default="shapes3d", help='Dataset')
 parser.add_argument('--seed', type=int, default=111, help='Seed')
+parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for Data Loaders")
+parser.add_argument("--ema_start", type=float, default=0.996, help="Starting factor for Exponential Moving Average")
+parser.add_argument("--lr", type=float, default=0.001, help="Reference Learning Rate")
+parser.add_argument("--start_lr", type=float, default=0.0002, help="Starting learning rate for scheduler")
+parser.add_argument("--final_lr", type=float, default=1e-06, help="Final learning rate for scheduler")
+parser.add_argument("--iters_per_ema", type=float, default=1.0, help="How many iterations before update of EMA")
+parser.add_argument("--wd", type=float, default=0.04, help="Reference Weight Decay")
+parser.add_argument("--final_wd", type=float, default=0.4, help="Final Weight Decay for scheduler")
+parser.add_argument("--ipe_scale", type=float, default=1.0, help="Scale factor for iterations per epoch")
 #parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
 #parser.add_argument('--model', type=str, required=True, help='Model type to use (e.g., resnet, cnn)')
 
@@ -31,7 +40,6 @@ FOVS = {"shapes3d": {'floor_hue': 10, 'wall_hue': 10, 'object_hue': 10,
                           'scale': 8, 'shape': 4, 'orientation': 15}}
 FOVS_PER_DATASET = {'shapes3d': ["floor_hue", "wall_hue", "object_hue", "scale", "shape", "orientation"]}
 #FOVS_PER_DATASET = {'shapes3d': ["floor_hue", "wall_hue", "scale", "shape", "orientation"]}
-
 args.best_model_criterion = "val_avg_acc"
 args.metrics = METRICS_PER_METHOD[args.train_method]
 args.dataset = "shapes3d"
@@ -46,4 +54,11 @@ args.task_to_label_index = {k: i for i, (k, v) in enumerate(FOVS[args.dataset].i
 args.data_dir = "/mnt/nas2/GrimaRepo/araymond/3dshapes"
 args.encoder = {'pretrained_feats': False, 'output_dim': 384, 'arch': 'vit', 'frozen': False}
 dls = get_dataloaders(args)
+
+
+# optimizatio
+args.warmup = 2.0/15.0*args.num_epochs
+
+
+
 train(args, dls)
