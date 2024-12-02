@@ -7,7 +7,7 @@
 #SBATCH --mail-user=afraymon@uc.cl    # mail donde mandar las notificaciones
 #SBATCH --chdir=/user/araymond    # direccion del directorio de trabajo
 #SBATCH --partition=ialab-high
-#SBATCH --nodelist=hydra            # forzamos scylla
+#SBATCH --nodelist=grievous            # forzamos scylla
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1                    # numero de nodos a usar
 #SBATCH --ntasks-per-node=1          # numero de trabajos (procesos) por nodo

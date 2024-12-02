@@ -1,11 +1,37 @@
 from torchvision.models import VisionTransformer
 from torchvision.models.vision_transformer import Encoder
+from torchvision import models, transforms
 from typing import Optional, Callable, List, NamedTuple
 from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
+
+
+# encoder.arch defines model! not training method!
+model_constructor = {
+    "vit_b_16": models.vit_b_16,    
+    "vit_b_32": models.vit_b_32,
+    "vit_l_16": models.vit_l_16,
+    "vit_l_32": models.vit_l_32
+}
+
+weights = {
+    "vit_b_16": models.ViT_B_16_Weights.IMAGENET1K_V1,    
+    "vit_b_32": models.ViT_B_32_Weights.IMAGENET1K_V1,
+    "vit_l_16": models.ViT_L_16_Weights.IMAGENET1K_V1,
+    "vit_l_32": models.ViT_L_32_Weights.IMAGENET1K_V1
+}
+
+model_output_dims = {
+    "lvit": 384,
+    "vit": 384,
+    "vit_b_16": 768,    
+    "vit_b_32": 768,
+    "vit_l_16": 1024,
+    "vit_l_32": 1024
+}
 
 class ConvStemConfig(NamedTuple):
     out_channels: int
@@ -176,7 +202,7 @@ class LatentVisionTransformer(VisionTransformer):
 
         # project latent to hidden_dim
         if latent is None:
-            latent = torch.zeros((bs, 6))    
+            latent = torch.zeros((bs, 6)).cuda() 
         latent = self.latent_proj(latent.float()).unsqueeze(1)  # (BS, 1, hidden_dim)
 
         # append latent to sequence
@@ -236,84 +262,117 @@ class MultiHeadClassifier(nn.Module):
         x = self.classifiers(x)
         return torch.split(x, self.output_dims, dim=1)
 
-def create_model(args):
 
-    if args.train_method == "erm":
-        model = VisionTransformer(
-            image_size=64,
-            patch_size=8,
-            num_layers=4,
-            num_heads=12,
-            hidden_dim=384,
-            mlp_dim=128,
-            num_classes=1
-        )
-        output_dims = [v for fov in args.fovs for k, v in args.n_fovs.items() if fov == k]
+# Possible Architectures
 
-        mhc = MultiHeadClassifier(input_dim=384, output_dims=output_dims)
-        model.heads = mhc
-        return (model,)
+# vit_b_16 224 x 224
+# vit_b_32 224 x 224
+# vit_l_16 224 x 224
+# vit_l_32 224 x 224
+#
 
-    elif args.train_method == "pair_erm": # We try to predict difference in latents
-        
-        model = PairVisionTransformer(
-            image_size=64,
-            patch_size=8,
-            num_layers=4,
-            num_heads=12,
-            hidden_dim=384,
-            mlp_dim=128,
-            num_classes=1
-        )
-        output_dims = [args.fovs_levels[k] for k in args.fovs_tasks]
-
-        mhc = MultiHeadClassifier(input_dim=384, output_dims=output_dims)
-        model.heads = mhc
-        return (model,)
-
-    elif "encoder_erm" == args.train_method:
-        output_dims = [args.fovs_levels[k] for k in args.fovs_tasks]
-        if args.encoder['pretrained_feats']:
-            encoder = nn.Identity()
-        
+def create_model(args):    
+    # baseline architectures
+    if args.encoder.arch in model_constructor:
+        model_weights = weights[args.encoder.arch] if args.encoder.pretrained else None 
+        encoder = model_constructor[args.encoder.arch](weights=model_weights)
+    else: # Custom Architectures
+        if args.pretrained_feats:
+            encoder = nn.Sequential(nn.Linear(model_output_dims[args.encoder['arch']], 384), nn.ReLU())
         else:
-            if args.encoder['arch'] == 'vit':
+            # Simple vision transformer
+            if args.encoder.arch == "vit":
                 encoder = VisionTransformer(
-                image_size=64,
-                patch_size=8,
-                num_layers=4,
-                num_heads=12,
-                hidden_dim=384,
-                mlp_dim=128,
-                num_classes=1
+                    image_size=64,
+                    patch_size=8,
+                    num_layers=4,
+                    num_heads=12,
+                    hidden_dim=384,
+                    mlp_dim=128,
+                    num_classes=1
                 )
-                encoder.heads = nn.Identity()
-                # load weights
-                # turn off weights if required
-            elif args.encoder['arch'] == "cnn":
-                encoder = SimpleConvModel()
-            if args.encoder['frozen']:
-                for p in encoder.parameters():
-                    p.requires_grad = False
-        # get encoder from args
-        # input dim is same size as encoder_dim
-        predictor = MultiHeadClassifier(input_dim=2*384, output_dims=output_dims)
-        #predictor = MLPPredictor(input_dim=2*args.encoder['output_dim'], output_dims=output_dims)
-        return encoder, predictor
+                output_dims = [v for fov in args.fovs for k, v in args.n_fovs.items() if fov == k]
+
+                mhc = MultiHeadClassifier(input_dim=model_output_dims[args.encoder['arch']], output_dims=output_dims)
+                encoder.heads = mhc
+
+            elif args.encoder.arch == "pair_vit":
+                encoder = model = PairVisionTransformer(
+                    image_size=64,
+                    patch_size=8,
+                    num_layers=4,
+                    num_heads=12,
+                    hidden_dim=384,
+                    mlp_dim=128,
+                    num_classes=1
+                )
+            elif args.encoder.arch == "lvit": # latent vision transformer
+                encoder = LatentVisionTransformer(
+                    image_size=64,
+                    patch_size=8,
+                    num_layers=4,
+                    num_heads=12,
+                    hidden_dim=384,
+                    mlp_dim=128,
+                    num_classes=1
+                    )
+            else:
+                raise ValueError(f"Unexpected architecture for encoder, received: {args.encoder['arch']}")
+
+    # Alter heads depending on training method
+    if args.train_method == "pair_erm": # We try to predict difference in latents
+        
+        output_dims = [args.fovs_levels[k] for k in args.fovs_tasks]
+        mhc = MultiHeadClassifier(input_dim=384, output_dims=output_dims)
+        encoder.heads = mhc
+        predictor = None
+
+    elif args.train_method == "encoder_erm":
+
+        output_dims = [args.fovs_levels[k] for k in args.fovs_tasks]
+        encoder.heads = nn.Identity()
+        predictor = MultiHeadClassifier(input_dim=2*model_output_dims[args.encoder.arch], output_dims=output_dims)
         
     elif args.train_method in ['task_jepa', 'ijepa']:
-        encoder = LatentVisionTransformer(
-            image_size=64,
-            patch_size=8,
-            num_layers=4,
-            num_heads=12,
-            hidden_dim=384,
-            mlp_dim=128,
-            num_classes=1
-        )
-        mhc = nn.Identity()
-        encoder.heads = mhc
-        target_encoder = copy.deepcopy(encoder)
+        
+        encoder.heads = nn.Identity()
+        predictor = copy.deepcopy(encoder)
         for p in target_encoder.parameters():
             p.requires_grad = False
-        return encoder, target_encoder
+
+    # Encoder Options
+    if args.encoder['id'] is not None:
+        # Path to the weights
+        path = f"models/{args.encoder['id']}/{args.encoder['epoch']}.pth"
+        print(f"Loading Weights from {path}")
+
+        # Load weights
+        weights = torch.load(path)
+        # Check for structural compatibility
+        def validate_state_dict(model, state_dict):
+            model_keys = set(model.state_dict().keys())
+            weight_keys = set(state_dict.keys())
+            if model_keys != weight_keys:
+                print(f"Warning: State dict mismatch! Model keys: {model_keys}, Weight keys: {weight_keys}")
+                return False
+            return True
+
+        # Validate and load weights into encoder
+        if validate_state_dict(encoder, weights['model_0']):
+            encoder.load_state_dict(weights['model_0'])
+            print("Encoder weights loaded successfully.")
+        else:
+            print("Encoder weights not loaded due to mismatch.")
+
+        # Validate and load weights into predictor
+        if validate_state_dict(predictor, weights['model_1']):
+            predictor.load_state_dict(weights['model_1'])
+            print("Predictor weights loaded successfully.")
+        else:
+            print("Predictor weights not loaded due to mismatch.")
+
+    # Freeze/unfreeze parameters
+    for p in encoder.parameters():
+        p.requires_grad = not args.encoder['frozen']
+
+    return encoder, predictor

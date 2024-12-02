@@ -9,6 +9,12 @@ parser = argparse.ArgumentParser(description="Example of argparse usage")
 # Add arguments
 parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs to train')
 parser.add_argument('--train_method', type=str, choices=['erm','task_jepa',"pair_erm","encoder_erm"], default="erm", help='Training Method')
+parser.add_argument('--frozen', action="store_true", help='Encoder is frozen or not')
+parser.add_argument('--resume', action="store_true", help='Resume Experiment or not')
+parser.add_argument('--experiment_id', type=str, default=None, help='Experiment id to resume run')
+parser.add_argument('--pretrained_id', type=str, default=None, help='Experiment id associated with checkpoint')
+parser.add_argument('--pretrained_epoch', type=int, default=50, help='Which epoch the checkpoint belongs to')
+parser.add_argument('--arch', type=str, choices=["lvit","vit","vit_b_16","vit_b_32","vit_l_16","vit_l_32"], default="vit", help='Encoder Architecture')
 parser.add_argument('--dataset', type=str, default="shapes3d", help='Dataset')
 parser.add_argument('--seed', type=int, default=111, help='Seed')
 parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for Data Loaders")
@@ -52,11 +58,19 @@ args.fovs_ids = [args.fovs_indices[x] for x in args.fovs_tasks ]
 args.n_fovs = FOVS[args.dataset]
 args.task_to_label_index = {k: i for i, (k, v) in enumerate(FOVS[args.dataset].items())}
 args.data_dir = "/mnt/nas2/GrimaRepo/araymond/3dshapes"
-args.encoder = {'pretrained_feats': False, 'output_dim': 384, 'arch': 'vit', 'frozen': False}
+args.encoder = {'pretrained_feats': False,
+                 'arch': args.arch,
+                'frozen': args.frozen,
+                'id': args.pretrained_id,
+                'epoch': args.pretrained_epoch,}
 dls = get_dataloaders(args)
 
+# Saving metrics and checkpoints
+args.save_weights = not args.test # only save checkpoints when not testing
+args.save_metrics = not args.test
+args.save_every = 10               # 
 
-# optimizatio
+# optimization
 args.warmup = 2.0/15.0*args.num_epochs
 
 
