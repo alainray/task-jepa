@@ -24,7 +24,6 @@ def step_encoder_erm(args, models, x, y, criterion, train=True):
     bs, *_ = x[0].shape
     
     x = torch.cat([x[0] , x[1]], dim=0) # concatenate along batch dimension for efficiency
-    
     features = encoder(x) 
     x_1 = features[:bs]
     x_2 = features[bs:]
@@ -64,11 +63,22 @@ def step_task_jepa(args, models, x, y, criterion, train=True):
     # Make image pairs (input, target) and assign correct latents
     x_input = x[0]
     x_target = x[1]
-    model_device = next(target_encoder.parameters()).device
-    targets = target_encoder(x_target, latents_zeros)
-    output = encoder(x_input, y)
+    # 4 cases 
+    # Same rep:
+    # x_0 with latent vs x_1
+    # x_0 vs x_1 with -latent
+    # Different rep
+    # x_0 vs x_1
+    # x_0 with latent vs x_1 with latent! 
 
-    avg_loss = criterion(output, targets)
+    model_device = next(target_encoder.parameters()).device
+    targets_1 = target_encoder(x_target, latents_zeros)
+    output_1 = encoder(x_input, y)
+    targets_2 = target_encoder(x_target, -y)
+    output_2 = encoder(x_input, latents_zeros)
+
+    avg_loss = criterion(output_1, targets_1) + criterion(output_2, targets_2)      # Should have same reps
+    avg_loss -= criterion(output_2, targets_1) + criterion(output_1, targets_2)     # Should have different reps
 
     #output = [o.detach().cpu() for o in output]
     
@@ -172,6 +182,12 @@ def run_epoch(args, model, dl, criterion, train=True, split = "train", print_eve
     # set up metric logging
     meters = setup_meters(args)
     # define train method
+    for m in model:
+        if m is not None:
+            if train:
+                m.train()
+            else:
+                m.eval()
     step_functions = {"encoder_erm": step_encoder_erm,
                       "erm": step_erm,
                       "pair_erm": step_pair_erm,
@@ -200,8 +216,6 @@ def run_epoch(args, model, dl, criterion, train=True, split = "train", print_eve
             
             if (n_batch+1) % print_every == 0 or n_batch == 0:
                 print(f"Iteration: {n_batch+1}")
-                print("enc",output[0][:5,[0,1,2,-3,-2,-1]])
-                print("tgt",output[1][:5,[0,1,2,-3,-2,-1]])
                 pprint_metrics(meters)
             # update target_encoder if training using JEPA
             if args.train_method in ["task_jepa", "ijepa"] and n_batch % args.iters_per_ema == 0 and train:
@@ -230,15 +244,28 @@ def train(args, dls):
 
 
     exp_name = get_exp_name(args)
-    wandb.init(settings=wandb.Settings(start_method="thread"),
+
+    if args.experiment_id is not None and args.resume: # resume wandb experiment
+        wandb.init(settings=wandb.Settings(start_method="thread"),
             # set the wandb project where this run will be logged
             project="task_jepa",
             # track hyperparameters and run metadata
             config=args,
-            name = exp_name
+            name = exp_name,
+            resume = "must",
+            id = args.experiment_id
         )
-    args.experiment_id = wandb.run.id
+    else:
+        wandb.init(settings=wandb.Settings(start_method="thread"),
+                # set the wandb project where this run will be logged
+                project="task_jepa",
+                # track hyperparameters and run metadata
+                config=args,
+                name = exp_name
+            )
+        args.experiment_id = wandb.run.id
     print(f"Experiment id is {args.experiment_id}")
+
     if args.train_method in ['task_jepa', 'ijepa']:
         
         args.ema = [args.ema_start, 1.0]      # exponential moving average
@@ -250,7 +277,20 @@ def train(args, dls):
     # define optimizer
     models = create_model(args)
 
-    models = tuple(model.cuda() for model in models)
+    models = tuple(model.cuda() for model in models if model is not None)
+
+    # Check if model is frozen or not
+
+    frozen = True
+    for p in models[0].parameters():
+        if p.requires_grad:
+            frozen = False
+    
+    if frozen:
+        print("Encoder is frozen!")
+    else:
+        print("Encoder is unfrozen!")
+
 
     #best_model = models
     #best_metrics = None
@@ -259,22 +299,25 @@ def train(args, dls):
 
     args.optimizer, args.scheduler, args.wd_scheduler = init_opt(args, models)
 
-
-    #params = list(models[0].parameters()) + list(models[1].parameters())
-    #optimizer = AdamW(params, lr=args.lr)
     criterion = get_criterion(args)
     # start W&B experiment
     all_metrics = {'train': [], 'val': [], 'test': []}
-    for epoch in tqdm(range(1, args.num_epochs+1)):
+    
+    args.epoch = 1
+
+    if args.resume: # reload last checkpoint: (epoch, model weights, scheduler, wd_scheduler, logged metrics)
+        args, models, all_metrics = resume_last_checkpoint(args, models)
+
+    for epoch in tqdm(range(args.epoch, args.num_epochs+1)):
         args.epoch = epoch
         full_metrics = dict()
         print(f"EPOCH {epoch}")
-        model, train_metrics = run_epoch(args, models, dls['train'], criterion, train=True, split = "train")
+        models, train_metrics = run_epoch(args, models, dls['train'], criterion, train=True, split = "train")
         print("[TRAIN]")
         pprint_metrics(train_metrics)
         train_metrics = remove_meters(train_metrics)
         wandb.log(format_metrics_wandb(train_metrics, split="train"), step=epoch)
-  
+
         train_metrics['epoch'] = epoch
         all_metrics['train'].append(format_metrics_wandb(train_metrics))
         # write metrics to disk
@@ -296,21 +339,15 @@ def train(args, dls):
         all_metrics['test'].append(format_metrics_wandb(test_metrics))
 
         # Save current model and metrics
-        save_model(args, models)
-        save_metrics(args, all_metrics)
-        '''if best_metrics is None:
-            best_metrics = {'train': train_metrics, 'val': val_metrics, 'test': test_metrics}
-        best_model, best_metrics = get_best_model(best_model, model, best_metrics,
-                                                  {'train': train_metrics, 'val': val_metrics, 'test': test_metrics},
-                                                  method=args.best_model_criterion)'''
+        if args.save_weights and epoch % args.save_every == 0:
+            save_model(args, models)
+        if args.save_metrics:
+            save_metrics(args, all_metrics)
+
+        # For resuming!
+        create_checkpoint(args, models, all_metrics)
 
     wandb.finish()
     model_dict = {k: args[k] for k in ['train_method', 'dataset', 'seed']}
     model_dict['model'] = tuple(m.state_dict() for m in best_model)
-    # save best_model plus its metrics if not testing
-    '''if args.test:
-        torch.save({ 'model': best_model,
-                    'metrics': best_metrics
 
-                    }, f"models/best_{get_exp_name(args)}.pth")'''
-        

@@ -1,9 +1,26 @@
 import torch
 import numpy as np
 from optim import CosineWDSchedule, WarmupCosineSchedule 
-from torch.optim import AdamW
+from torch.optim import AdamW, SGD
 import os
-import pandas as pd 
+import pandas as pd
+import wandb
+from easydict import EasyDict as edict
+
+def get_args(run_id, update_id=False):
+    # Initialize the W&B API
+    api = wandb.Api()
+    # Specify the project and run ID
+    project_name = "task_jepa"
+    # Fetch the run
+    run = api.run(f"{wandb.api.default_entity}/{project_name}/{run_id}")
+    # Get the hyperparameters
+    args = edict(run.config)
+    if update_id:
+        args.experiment_id = run_id
+    return args
+
+
 def set_seed(seed):
     """Sets seed"""
     if torch.cuda.is_available():
@@ -44,10 +61,13 @@ class AverageMeter:
 def get_exp_name(args):
     if "encoder" in args:
         encoder = args.encoder.arch + "_"
+    
+    experiment_id = ""
+    
     if "experiment_id" in args:
-        experiment_id = "_" + args.experiment_id
-    else:
-        experiment_id = ""
+        if args.experiment_id is not None:
+            experiment_id = "_" + args.experiment_id
+
     return f"{args.dataset}_{args.train_method}_{encoder}{args.seed}{experiment_id}"
 
 def setup_meters(args):
@@ -181,7 +201,7 @@ def init_opt(
         }
     ]
 
-        optimizer = torch.optim.AdamW(param_groups)
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.wd)
         scheduler = WarmupCosineSchedule(
             optimizer,
             warmup_steps=int(args.warmup*args.ipe),
@@ -205,7 +225,8 @@ def init_opt(
             param_groups = [
                 {'params': models[0].parameters()}
             ]
-        optimizer = AdamW(param_groups, lr=args.lr, wd=args.wd)
+        optimizer = AdamW(param_groups, lr=args.lr, weight_decay=args.wd)
+        #optimizer = SGD(param_groups, lr=args.lr, weight_decay=args.wd)
         scheduler = None
         wd_scheduler = None
 
@@ -238,3 +259,78 @@ def save_metrics(args, all_metrics):
     for k, v in all_metrics.items():
         df = pd.DataFrame(v)
         df.to_csv(f"{save_dir}/{k}_{args.epoch}.csv")
+
+
+def create_checkpoint(args, model, metrics):
+
+    ckpt = dict()
+    # Construct the directory path
+    save_dir = f"results/{args.experiment_id}"
+    ckpt_path = save_dir + "/last_checkpoint.pth"
+    # Create the directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    n, w = next(iter(model[1].named_parameters()))
+    print("Classifier 1", n, w)
+    models = {f'model_{i}': m.state_dict() for i, m in enumerate(model) if m is not None}
+    print("classifier", models["model_1"][n])
+    ckpt['optimizer'] = args.optimizer.state_dict() if args.optimizer is not None else None
+    print(f"Saved learning rate: {args.optimizer.param_groups[0]['lr']}")
+    ckpt['scheduler'] = args.scheduler.state_dict() if args.scheduler is not None else None
+    ckpt['wd_scheduler'] = args.wd_scheduler.state_dict() if args.wd_scheduler is not None else None
+    ckpt['model'] = models
+    ckpt['metrics'] = metrics
+    ckpt['epoch'] = args.epoch
+    ckpt['random_state'] = get_random_state()
+    ckpt['momentum_scheduler'] = args.momentum_scheduler if "momentum_scheduler" in args else None
+    temp_path = save_dir + "/temp.pth"
+    torch.save(ckpt, temp_path)
+    os.rename(temp_path, ckpt_path)
+
+def get_random_state():
+    checkpoint = {
+        #'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'torch_cuda': torch.cuda.get_rng_state_all(),
+    }
+    return checkpoint
+
+def restore_random_state(random_state):
+    torch.set_rng_state(random_state['torch'])
+    torch.cuda.set_rng_state_all(random_state['torch_cuda'])  # For all CUDA devices
+    np.random.set_state(random_state['numpy'])
+    #random.setstate(random_state['python'])
+
+def resume_last_checkpoint(args, model):
+
+    
+    path_to_checkpoint = f"results/{args.experiment_id}/last_checkpoint.pth"
+    ckpt = torch.load(path_to_checkpoint)
+    
+    args.epoch = ckpt['epoch']
+
+    print("Loaded Encoder weights")
+    model[0].load_state_dict(ckpt['model']['model_0'])
+    
+    if "model_1" in ckpt['model']:
+        print("Loaded predictor weights")
+        print(ckpt['model']['model_1']['classifiers.0.weight'])
+        model[1].load_state_dict(ckpt['model']['model_1'])
+    
+    optimizer, scheduler, wd_scheduler = init_opt(args, model)
+    if args.optimizer is not None:
+        args.optimizer = optimizer
+        args.optimizer.load_state_dict(ckpt['optimizer'])
+
+    if args.scheduler is not None:
+        args.scheduler = scheduler
+        args.scheduler.load_state_dict(ckpt['scheduler'])
+    if args.wd_scheduler is not None:
+        args.wd_scheduler = wd_scheduler
+        args.wd_scheduler.load_state_dict(ckpt['wd_scheduler'])
+    if "momentum_scheduler" in ckpt:
+        args.momentum_scheduler = ckpt['momentum_scheduler']
+    restore_random_state(ckpt['random_state'])
+    print(f"Restored learning rate: {args.optimizer.param_groups[0]['lr']}")
+    
+    return args, model, ckpt['metrics']

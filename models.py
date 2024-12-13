@@ -7,8 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
-
-
+from utils import get_args
 # encoder.arch defines model! not training method!
 model_constructor = {
     "vit_b_16": models.vit_b_16,    
@@ -164,6 +163,7 @@ class LatentVisionTransformer(VisionTransformer):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         num_classes: int = 1000,
+        n_latent_attributes: int = 6,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         conv_stem_configs: Optional[List] = None,
@@ -182,7 +182,8 @@ class LatentVisionTransformer(VisionTransformer):
             norm_layer=norm_layer,
             conv_stem_configs=conv_stem_configs,
         )
-        self.latent_proj = nn.Linear(6, hidden_dim)
+        self.n_latent_attributes = n_latent_attributes
+        self.latent_proj = nn.Linear(self.n_latent_attributes, hidden_dim)
         # Since we are adding a new token for the latent vector we need to increase sequence length 
         self.seq_length += 1
         self.encoder = Encoder(
@@ -202,7 +203,7 @@ class LatentVisionTransformer(VisionTransformer):
 
         # project latent to hidden_dim
         if latent is None:
-            latent = torch.zeros((bs, 6)).cuda() 
+            latent = torch.zeros((bs, self.n_latent_attributes)).to(x.device) 
         latent = self.latent_proj(latent.float()).unsqueeze(1)  # (BS, 1, hidden_dim)
 
         # append latent to sequence
@@ -222,19 +223,6 @@ class LatentVisionTransformer(VisionTransformer):
 
         return x
 
-
-def load_encoder(encoder_args):
-
-    if encoder_args['arch'] == "latent_vt":
-        encoder = LatentVisionTransformer(
-            image_size=64,
-            patch_size=8,
-            num_layers=4,
-            num_heads=12,
-            hidden_dim=384,
-            mlp_dim=128,
-            num_classes=1
-        )
 
 class MLPPredictor(nn.Module):
     def __init__(self, input_dim=100, hidden_dim=128, output_dims=[1]):
@@ -271,11 +259,16 @@ class MultiHeadClassifier(nn.Module):
 # vit_l_32 224 x 224
 #
 
-def create_model(args):    
+def create_model(args): 
+    global weights
     # baseline architectures
     if args.encoder.arch in model_constructor:
-        model_weights = weights[args.encoder.arch] if args.encoder.pretrained else None 
-        encoder = model_constructor[args.encoder.arch](weights=model_weights)
+        # if frozen use pretrained reps instead of freezing encoder which is more expensive.
+        if not args.encoder.frozen:
+            model_weights = weights[args.encoder.arch] if args.encoder.pretrained else None 
+            encoder = model_constructor[args.encoder.arch](weights=model_weights)
+        else:
+            encoder = nn.Identity()
     else: # Custom Architectures
         if args.pretrained_feats:
             encoder = nn.Sequential(nn.Linear(model_output_dims[args.encoder['arch']], 384), nn.ReLU())
@@ -314,42 +307,75 @@ def create_model(args):
                     num_heads=12,
                     hidden_dim=384,
                     mlp_dim=128,
-                    num_classes=1
+                    num_classes=1,
+                    n_latent_attributes = 6 if args.dataset == "shapes3d" else 5
                     )
             else:
                 raise ValueError(f"Unexpected architecture for encoder, received: {args.encoder['arch']}")
 
     # Alter heads depending on training method
+
     if args.train_method == "pair_erm": # We try to predict difference in latents
         
-        output_dims = [args.fovs_levels[k] for k in args.fovs_tasks]
+        output_dims = [args.fovs_levels[args.dataset][k] for k in args.fovs_tasks]
         mhc = MultiHeadClassifier(input_dim=384, output_dims=output_dims)
-        encoder.heads = mhc
+        if hasattr(encoder, "heads"):
+            encoder.heads = mhc
         predictor = None
 
+    elif args.train_method == 'rep_train':
+        rep_dim = model_output_dims[args.pretrained_reps]
+        if hasattr(encoder, "heads"):
+            encoder.heads = nn.Sequential(nn.ReLU(), nn.Linear(model_output_dims[args.encoder.arch], rep_dim))
+        predictor = None
+    elif args.encoder['pretrain_method'] == "rep_train":
+
+        a = get_args(args.encoder['id']) # get arguments to get pretrain reps
+        pretrain_reps = a.pretrained_reps
+        rep_dim = model_output_dims[pretrain_reps]
+        if hasattr(encoder, "heads"):
+            encoder.heads = nn.Sequential(nn.ReLU(), nn.Linear(model_output_dims[args.encoder.arch], rep_dim))
+        output_dims = [args.fovs_levels[args.dataset][k] for k in args.fovs_tasks]
+        predictor = MultiHeadClassifier(input_dim=2*rep_dim, output_dims=output_dims)
     elif args.train_method == "encoder_erm":
 
-        output_dims = [args.fovs_levels[k] for k in args.fovs_tasks]
-        encoder.heads = nn.Identity()
+        output_dims = [args.fovs_levels[args.dataset][k] for k in args.fovs_tasks]
+        if hasattr(encoder, "heads"):
+            encoder.heads = nn.Identity()
         predictor = MultiHeadClassifier(input_dim=2*model_output_dims[args.encoder.arch], output_dims=output_dims)
         
     elif args.train_method in ['task_jepa', 'ijepa']:
-        
-        encoder.heads = nn.Identity()
+        if hasattr(encoder, "heads"):
+            encoder.heads = nn.Identity()
         predictor = copy.deepcopy(encoder)
-        for p in target_encoder.parameters():
+        for p in predictor.parameters():
             p.requires_grad = False
 
+
+
     # Encoder Options
-    if args.encoder['id'] is not None:
+    if args.encoder['id'] is not None: # We want to load weights from previous experiment "id"
         # Path to the weights
-        path = f"models/{args.encoder['id']}/{args.encoder['epoch']}.pth"
+        path = f"results/{args.dataset}/{args.encoder['id']}/epoch={args.encoder['epoch']-1}.ckpt"
+        #path = f"models/{args.encoder['id']}/{args.encoder['epoch']}.pth"
         print(f"Loading Weights from {path}")
 
         # Load weights
-        weights = torch.load(path)
+        # if model trained with rep_train
+    
+        weights = torch.load(path)['state_dict']
+        encoder_weights = {k[8:]: v for k,v in weights.items() if "encoder" in k}
+        if len(encoder_weights) > 0:
+            print("Loading Encoder Weights from Checkpoint!")
+            encoder.load_state_dict(encoder_weights)
+        predictor_weights = {k[10:]: v for k,v in weights.items() if "predictor" in k}
+        if len(predictor_weights) > 0:
+            print("Loading Predictor Weights from Checkpoint!")
+            predictor.load_state_dict(predictor_weights)
+        # else you should also load the predictor
+
         # Check for structural compatibility
-        def validate_state_dict(model, state_dict):
+        '''def validate_state_dict(model, state_dict):
             model_keys = set(model.state_dict().keys())
             weight_keys = set(state_dict.keys())
             if model_keys != weight_keys:
@@ -369,7 +395,7 @@ def create_model(args):
             predictor.load_state_dict(weights['model_1'])
             print("Predictor weights loaded successfully.")
         else:
-            print("Predictor weights not loaded due to mismatch.")
+            print("Predictor weights not loaded due to mismatch.")'''
 
     # Freeze/unfreeze parameters
     for p in encoder.parameters():
