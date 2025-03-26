@@ -1,6 +1,6 @@
 from torchvision.models import VisionTransformer
+from model_info import encoder_constructor,encoders, modulators, weights, model_output_dims
 from torchvision.models.vision_transformer import Encoder
-from torchvision import models, transforms
 from typing import Optional, Callable, List, NamedTuple
 from functools import partial
 import torch
@@ -8,29 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 from utils import get_args
-# encoder.arch defines model! not training method!
-model_constructor = {
-    "vit_b_16": models.vit_b_16,    
-    "vit_b_32": models.vit_b_32,
-    "vit_l_16": models.vit_l_16,
-    "vit_l_32": models.vit_l_32
-}
-
-weights = {
-    "vit_b_16": models.ViT_B_16_Weights.IMAGENET1K_V1,    
-    "vit_b_32": models.ViT_B_32_Weights.IMAGENET1K_V1,
-    "vit_l_16": models.ViT_L_16_Weights.IMAGENET1K_V1,
-    "vit_l_32": models.ViT_L_32_Weights.IMAGENET1K_V1
-}
-
-model_output_dims = {
-    "lvit": 384,
-    "vit": 384,
-    "vit_b_16": 768,    
-    "vit_b_32": 768,
-    "vit_l_16": 1024,
-    "vit_l_32": 1024
-}
 
 class ConvStemConfig(NamedTuple):
     out_channels: int
@@ -39,6 +16,102 @@ class ConvStemConfig(NamedTuple):
     norm_layer: Callable[..., nn.Module] = nn.BatchNorm2d
     activation_layer: Callable[..., nn.Module] = nn.ReLU
 # It assumes a pair of images concatenated along the sequence dimension
+
+class DownsizeTransformer(nn.Module):
+    def __init__(self, n_modules=3, hidden_dim = 768, output_dim=16, num_heads=4, num_layers=3):
+        super(DownsizeTransformer, self).__init__()
+        self.class_token = nn.Parameter(torch.zeros(1, 1, output_dim))
+        self.semantic_encoder = VisionTransformer(
+                    image_size=64,
+                    patch_size=8,
+                    num_layers=4,
+                    num_heads=12,
+                    hidden_dim=hidden_dim,
+                    mlp_dim=128,
+                    num_classes=1
+                )
+        self.semantic_encoder.heads = nn.Identity()
+        self.proj = nn.Linear(5, output_dim)
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.semantic_encoder.heads = nn.Identity()
+        self.semantic_encoder.conv_proj = nn.Conv2d(
+                in_channels=1, out_channels=hidden_dim, kernel_size=8, stride=8
+            ) # Dataset is black and white
+        '''mlps = [nn.Linear(hidden_dim+5, output_dim)] # hidden_dim + 5 latent factors
+        for i in range(n_modules-1):
+            mlps.append(nn.ReLU())
+            mlps.append(nn.Linear(output_dim,output_dim))'''
+        encoder_layer = nn.TransformerEncoderLayer(
+                        d_model=output_dim,
+                        nhead=num_heads, 
+                        dim_feedforward=hidden_dim,
+                        batch_first=True
+                        )
+        self.transform_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x, l): 
+        n = x.shape[0]
+        rep = self.semantic_encoder(x)
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        r = rep.view(-1, self.hidden_dim//self.output_dim,self.output_dim)
+        l = self.proj(l).view(-1,1,self.output_dim)
+        r = torch.cat([r,l],dim=1)
+        print(r.shape, batch_class_token.shape)
+        r = torch.cat([batch_class_token,r],dim=1)
+        #with_latent = torch.cat((rep,l), dim=-1)
+        final_rep = self.transform_encoder(r)[:,0]
+        return rep, final_rep
+
+        
+class SimpleVTransformer(nn.Module):
+    def __init__(self, n_modules=3, hidden_dim = 768, output_dim=16, num_heads=4, num_layers=3):
+        super(DownsizeTransformer, self).__init__()
+        self.class_token = nn.Parameter(torch.zeros(1, 1, output_dim))
+        self.semantic_encoder = VisionTransformer(
+                    image_size=64,
+                    patch_size=8,
+                    num_layers=4,
+                    num_heads=12,
+                    hidden_dim=hidden_dim,
+                    mlp_dim=128,
+                    num_classes=1
+                )
+        self.semantic_encoder.heads = nn.Identity()
+        self.proj = nn.Linear(5, output_dim)
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.semantic_encoder.heads = nn.Identity()
+        self.semantic_encoder.conv_proj = nn.Conv2d(
+                in_channels=1, out_channels=hidden_dim, kernel_size=8, stride=8
+            ) # Dataset is black and white
+        '''mlps = [nn.Linear(hidden_dim+5, output_dim)] # hidden_dim + 5 latent factors
+        for i in range(n_modules-1):
+            mlps.append(nn.ReLU())
+            mlps.append(nn.Linear(output_dim,output_dim))'''
+        encoder_layer = nn.TransformerEncoderLayer(
+                        d_model=output_dim,
+                        nhead=num_heads, 
+                        dim_feedforward=hidden_dim,
+                        batch_first=True
+                        )
+        self.transform_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x, l): 
+        n = x.shape[0]
+        rep = self.semantic_encoder(x)
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        r = rep.view(-1, self.hidden_dim//self.output_dim,self.output_dim)
+        l = self.proj(l).view(-1,1,self.output_dim)
+        r = torch.cat([r,l],dim=1)
+        print(r.shape, batch_class_token.shape)
+        r = torch.cat([batch_class_token,r],dim=1)
+        #with_latent = torch.cat((rep,l), dim=-1)
+        final_rep = self.transform_encoder(r)[:,0]
+        return rep, final_rep
+
 
 class PairVisionTransformer(VisionTransformer):
     def __init__(
@@ -117,6 +190,8 @@ class PairVisionTransformer(VisionTransformer):
         x = self.heads(x)
 
         return x
+
+
 
 class SimpleConvModel(nn.Module):
     def __init__(self):
@@ -262,13 +337,28 @@ class MultiHeadClassifier(nn.Module):
 def create_model(args): 
     global weights
     # baseline architectures
-    if args.encoder.arch in model_constructor:
+
+    # Define encoder
+    # Define modulator
+    # Freeze/unfreeze weights
+    model_weights = weights[args.encoder.arch] if args.encoder.pretrained else None 
+    encoder = encoders[args.encoder.arch](args, weights=model_weights) if args.encoder.arch != "none" else None
+    input_dims = model_output_dims[args.encoder.arch] if args.encoder.arch != "none" else  model_output_dims[args.pretrained_reps]
+
+    print("input_dim",input_dims,
+          "hidden_dim",args.modulator.hidden_dim)
+    modulator = modulators[args.train_method](input_dim=input_dims,
+                                              hidden_dim=args.modulator.hidden_dim,
+                                              latent_dim = 5 if args.dataset == "idsprites" else 6
+                                              )
+    '''
+    if args.encoder.arch in encoder_constructor:
         # if frozen use pretrained reps instead of freezing encoder which is more expensive.
         if not args.encoder.frozen:
-            model_weights = weights[args.encoder.arch] if args.encoder.pretrained else None 
+
             encoder = model_constructor[args.encoder.arch](weights=model_weights)
         else:
-            encoder = nn.Identity()
+            encoder = None
     else: # Custom Architectures
         if args.pretrained_feats:
             encoder = nn.Sequential(nn.Linear(model_output_dims[args.encoder['arch']], 384), nn.ReLU())
@@ -310,11 +400,17 @@ def create_model(args):
                     num_classes=1,
                     n_latent_attributes = 6 if args.dataset == "shapes3d" else 5
                     )
+            elif args.encoder.arch == "down": # latent vision transformer
+                rep_dim = model_output_dims[args.pretrained_reps]
+                encoder = DownsizeTransformer(
+                                              n_modules = 3,
+                                              hidden_dim = rep_dim,
+                                              output_dim = args.encoder.enc_dims
+                                              )
             else:
                 raise ValueError(f"Unexpected architecture for encoder, received: {args.encoder['arch']}")
 
     # Alter heads depending on training method
-
     if args.train_method == "pair_erm": # We try to predict difference in latents
         
         output_dims = [args.fovs_levels[args.dataset][k] for k in args.fovs_tasks]
@@ -328,8 +424,8 @@ def create_model(args):
         if hasattr(encoder, "heads"):
             encoder.heads = nn.Sequential(nn.ReLU(), nn.Linear(model_output_dims[args.encoder.arch], rep_dim))
         predictor = None
-    elif args.encoder['pretrain_method'] == "rep_train":
 
+    elif args.encoder['pretrain_method'] == "rep_train":
         a = get_args(args.encoder['id']) # get arguments to get pretrain reps
         pretrain_reps = a.pretrained_reps
         rep_dim = model_output_dims[pretrain_reps]
@@ -337,6 +433,7 @@ def create_model(args):
             encoder.heads = nn.Sequential(nn.ReLU(), nn.Linear(model_output_dims[args.encoder.arch], rep_dim))
         output_dims = [args.fovs_levels[args.dataset][k] for k in args.fovs_tasks]
         predictor = MultiHeadClassifier(input_dim=2*rep_dim, output_dims=output_dims)
+
     elif args.train_method == "encoder_erm":
 
         output_dims = [args.fovs_levels[args.dataset][k] for k in args.fovs_tasks]
@@ -350,8 +447,6 @@ def create_model(args):
         predictor = copy.deepcopy(encoder)
         for p in predictor.parameters():
             p.requires_grad = False
-
-
 
     # Encoder Options
     if args.encoder['id'] is not None: # We want to load weights from previous experiment "id"
@@ -373,32 +468,10 @@ def create_model(args):
             print("Loading Predictor Weights from Checkpoint!")
             predictor.load_state_dict(predictor_weights)
         # else you should also load the predictor
-
-        # Check for structural compatibility
-        '''def validate_state_dict(model, state_dict):
-            model_keys = set(model.state_dict().keys())
-            weight_keys = set(state_dict.keys())
-            if model_keys != weight_keys:
-                print(f"Warning: State dict mismatch! Model keys: {model_keys}, Weight keys: {weight_keys}")
-                return False
-            return True
-
-        # Validate and load weights into encoder
-        if validate_state_dict(encoder, weights['model_0']):
-            encoder.load_state_dict(weights['model_0'])
-            print("Encoder weights loaded successfully.")
-        else:
-            print("Encoder weights not loaded due to mismatch.")
-
-        # Validate and load weights into predictor
-        if validate_state_dict(predictor, weights['model_1']):
-            predictor.load_state_dict(weights['model_1'])
-            print("Predictor weights loaded successfully.")
-        else:
-            print("Predictor weights not loaded due to mismatch.")'''
-
+    '''
     # Freeze/unfreeze parameters
-    for p in encoder.parameters():
-        p.requires_grad = not args.encoder['frozen']
+    if args.encoder.arch != "none":
+        for p in encoder.parameters():
+            p.requires_grad = not args.encoder['frozen']
 
-    return encoder, predictor
+    return encoder, modulator
