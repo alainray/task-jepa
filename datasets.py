@@ -5,7 +5,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split, Subset, TensorDataset, Dataset
 from easydict import EasyDict as edict
 from models import weights
-from utils import set_seed
+from utils import set_seed, get_args
 from functools import partial
 from torch.utils.data import Dataset
 from os.path import join
@@ -13,11 +13,39 @@ from sklearn.model_selection import train_test_split
 import random 
 import torch.nn.functional as F
 
+import torch
+
+def pairwise_collate_fn(batch, k=20):
+    # Unpack the batch
+    imgs, reps, latents = zip(*batch)
+
+    # Stack tensors
+    imgs = torch.stack(imgs)            # (B, C, H, W)
+    reps = torch.stack(reps)            # (B, D)
+    latents = torch.stack(latents)      # (B, L)
+
+    B = imgs.size(0)  # batch size
+
+    # Sample k indices for each item in the batch (with replacement)
+    dst_indices = torch.randint(0, B, (B, k))
+
+    # Gather destination elements
+    dst_imgs = imgs[dst_indices]             # (B, k, C, H, W)
+    dst_reps = reps[dst_indices]             # (B, k, D)
+    dst_latents = latents[dst_indices]       # (B, k, L)
+
+    # Expand src_latents for broadcasting: (B, 1, L)
+    src_latents_exp = latents.unsqueeze(1).expand(-1, k, -1)
+    deltas = dst_latents - src_latents_exp   # (B, k, L)
+
+    return imgs, reps, dst_imgs, dst_reps, deltas.float(), latents.float(), dst_latents.float()
+
+
 class IdSpritesEval(torch.utils.data.Dataset):
     def __init__(self, args, data, indices, max_delta=14, num_samples=2, p_skip=0, test=False, return_indices=False):
         self.return_indices = return_indices
         self.args = args
-        self.n_latents = 5 if self.args.dataset == "idsprites" else 6
+
         if test:
             indices = [0, 38416, 
                 2744, 
@@ -31,12 +59,14 @@ class IdSpritesEval(torch.utils.data.Dataset):
                 2 ]
         self.p_skip = p_skip
         self.num_samples = num_samples
+        self.have_reps = "reps" in "data" and data['reps'] is not None 
         self.images = data['images'][indices]
         self.latents = data['latents'][indices] if "latents" in data else torch.empty(len(self.images),1)
+        self.n_latents = self.latents.shape[-1]
         self.latent_ids = data['latent_ids'][indices]
-        self.reps = data['reps'][indices] if "reps" in data else torch.empty(len(self.images),1)
-        self.pretrain_reps = self.reps.numel() > 0
-        if self.pretrain_reps:
+        self.reps = data['reps'][indices] if self.have_reps else torch.empty(len(self.images),1)
+
+        if self.have_reps:
             print("Recentering representations!")
             self.reps = self.reps - self.reps.mean(dim=0)
             print("Normalizing reps!")
@@ -45,9 +75,10 @@ class IdSpritesEval(torch.utils.data.Dataset):
         self.latent_to_idx = {
             tuple(l.tolist()): idx for idx, l in enumerate(self.latent_ids)
         }
-        self.meta = data['meta']
+        #self.meta = data['meta']
         self.indices = indices
-        self.max_delta = max_delta 
+        self.max_delta = max_delta
+        print(len(self.latent_to_idx), len(self.latents))
         # vizable indices are those in the indices
         # self.viable_indices = torch.zeros((len(self.images))).bool()
         # self.viable_indices[indices] = True
@@ -64,7 +95,6 @@ class IdSpritesEval(torch.utils.data.Dataset):
                 
                 delta[idx] = -delta_val
                 yield tuple(delta)
-                
     
     def __getitem__(self, idx):
         latent = self.latent_ids[idx]
@@ -73,8 +103,11 @@ class IdSpritesEval(torch.utils.data.Dataset):
         for delta in self.generate_deltas():
             if random.random() < self.p_skip:
                 continue
-                
-            new_latent = latent + torch.tensor(delta)
+            #new_latent = latent + torch.tensor(delta)
+            delta_tensor = torch.tensor(delta, device=latent.device, dtype=latent.dtype)
+
+            new_latent = latent + delta_tensor
+
             new_latent = tuple(new_latent.tolist())
             if not new_latent in self.latent_to_idx:
                 continue
@@ -83,18 +116,19 @@ class IdSpritesEval(torch.utils.data.Dataset):
             deltas.append(delta)
             if len(image_ids) == self.num_samples:
                 break
-          
+
         images = self.images[image_ids]
         reps = self.reps[image_ids]
         deltas = torch.tensor(deltas)
         src_image = self.images[idx]
         src_rep = self.reps[idx]
+        src_latents = self.latent_ids[idx]
+        latents = self.latent_ids[image_ids]
             
         if self.return_indices:
-            return idx, src_image, src_rep, images, reps, deltas.float()
+            return idx, src_image, src_rep, images, reps, deltas.float(), src_latents.float(), latents.float()
         else:
-
-            return src_image, src_rep, images, reps, deltas.float()
+            return src_image, src_rep, images, reps, deltas.float(), src_latents.float(), latents.float()
 
     def __len__(self):
         return len(self.latent_ids)
@@ -150,28 +184,34 @@ def get_indices(args):
 
             if split == "iid":
                 all_indices.append(idx)
-    elif args.dataset == "3dshapes":
-        all_indices = torch.load(f"3dshapes/shapes3d_{args.sub_dataset}_test_indices.pth") # NOTE: This is NOT a typo! splits seem to be inverted at the origin
-        test_indices = torch.load(f"3dshapes/shapes3d_{args.sub_dataset}_train_indices.pth") # not used for training but for post training eval
-        train_indices, _ = train_test_split(all_indices, test_size = 0.1, random_state=42)
 
-    return train_indices, all_indices
+    elif args.dataset in ["3dshapes","mpi3d"]:
+        all_indices = torch.load(f"{args.dataset}/{args.dataset}_{args.sub_dataset}_train_indices.pth") 
+        test_indices = torch.load(f"{args.dataset}/{args.dataset}_{args.sub_dataset}_test_indices.pth") # not used for training but for post training eval
+        train_indices, val_indices = train_test_split(all_indices, test_size = 0.1, random_state=42)
+ 
+    if args.train_method != "regression":
+        val_indices = all_indices
+
+    return train_indices, val_indices
 
 def load_datasets(args):
+    datasets = dict()
+    print(f"Loading {args.dataset.capitalize()} dataset...")
+    data = torch.load(f"{args.dataset}/{args.dataset}.pth", map_location="cpu")
+    reps_path = None
+    if args.pretrained_reps:
+        reps_path = args.pretrained_reps
+    elif args.pretrained_encoder:
+        encoder_args = get_args(args.pretrained_encoder)
+        reps_path = encoder_args.pretrained_reps
 
-    if args.dataset in ["3dshapes", "idsprites"]:
-        
-        datasets = dict()
-
-        print(f"Loading {args.dataset.capitalize()} dataset...")
-
-        root = args.data_dir
-        data = torch.load(f"{args.dataset}/{args.dataset}.pth", map_location="cpu")
-        if args.pretrained_reps:
-            data['reps'] = torch.load(f"{args.dataset}/{args.dataset}_images_feats_{args.pretrained_reps}.pth", map_location="cpu")
-        
-        train_indices, val_indices = get_indices(args)
-        
+    if args.encoder.arch == "none":
+        data['reps'] = torch.load(f"{args.dataset}/{args.dataset}_images_feats_{reps_path}.pth", map_location="cpu") if reps_path else None
+    
+    train_indices, val_indices = get_indices(args)
+    if args.train_method != "regression" and not args.make_random_batches:
+                      
         datasets['train'] = IdSpritesEval(
             args,
             data,
@@ -189,38 +229,44 @@ def load_datasets(args):
             p_skip=0.0,
             test=args.test
         )
-     
-        return datasets
+
+    elif args.train_method == "regression" or args.make_random_batches:
+        if "reps" not in data or data['reps'] is None:
+            data['reps'] = torch.empty(len(data['images']),1)
+
+        else:
+            print("Recentering representations!")
+            data['reps'] = data['reps'] - data['reps'].mean(dim=0)
+            print("Normalizing reps!")
+            data['reps'] = torch.nn.functional.normalize(data['reps'], p=2.0, dim=1, eps=1e-12)
+        datasets['train'] = TensorDataset(
+                            data['images'][train_indices],
+                            data['reps'][train_indices],
+                            data['latent_ids'][train_indices]
+                        )
+        datasets['val'] = TensorDataset(
+                    data['images'][val_indices],
+                    data['reps'][val_indices],
+                    data['latent_ids'][val_indices]
+                )
     else:
-        raise ValueError(f"Dataset {args.dataset} not supported!")
+        raise ValueError(f"Method '{args.train_method}' not supported!")
+
+    return datasets
 
 def get_dataloaders(args, splits=['train','val']):
-    ds = load_datasets(args)
-
-    #if args.test:
-    #    for ds_name, dataset in ds.items():
-    #        ds[ds_name] =  Subset(dataset, list(range(16)))
     
-    bs = {
-            'erm': {'train': 256, 'val': 1024, 'test': 1024},
-            'task_jepa': {'train': 16, 'val': 32, 'test': 32},
-            'pair_erm': {'train': 16, 'val': 32, 'test': 32},
-            'encoder_erm': {'train': 16, 'val': 32, 'test': 32, 'scale': 32, 'orientation': 32, 'x': 32, 'y': 32},
-            'rep_train': {'train': args.train_bs, 'val': args.train_bs, 'test': args.train_bs, 'scale': 32, 'orientation': 32, 'x': 32, 'y': 32} 
-         }
+    ds = load_datasets(args)
+    
+    bs = {'train': args.train_bs, 'val': args.train_bs, 'test': args.train_bs}
 
-    collators = { '3dshapes': {'rep_train': None},
-                  'idsprites': {
-                        'rep_train': None#partial(create_pairs, mode="diff", dataset="idsprites", train_method=args.train_method)
-                    }
-    }
     dls = {split : DataLoader(ds[split],
-        collate_fn = collators[args.dataset][args.train_method],
+        collate_fn = pairwise_collate_fn if args.make_random_batches else None, # collators[args.dataset][args.train_method],
         num_workers=args.num_workers,
-        persistent_workers= True,
-        prefetch_factor = 2,
+        persistent_workers= args.num_workers > 0,
+        prefetch_factor = 2 if args.num_workers > 0 else None,
         pin_memory=True,
-        batch_size = bs[args.train_method][split],
+        batch_size = bs[split], #bs[args.train_method][split],
         shuffle=split == "train") 
             for split in splits}
     return dls

@@ -1,7 +1,7 @@
 import lightning as L
 import torch
 import torch.nn as nn
-from models import VisionTransformer,LatentVisionTransformer, MultiHeadClassifier, PairVisionTransformer, MultiHeadClassifier
+from models import get_lightning_model
 from lightning.pytorch.callbacks import ModelCheckpoint
 from rich.table import Table
 from rich.console import Console
@@ -18,133 +18,6 @@ import numpy as np
 from models import create_model
 from utils import get_exp_name
 
-
-class LightningRepClassification(L.LightningModule):
-    def __init__(self, args, encoder, modulator):
-        super().__init__()
-        self.encoder = encoder
-        self.use_reps = encoder is None
-        self.modulator = modulator
-        self.criterion = F.cosine_similarity
-        self.args = args
-    
-    # We try to replicate the learned representation as a start.
-    # We learn to replicate the representation when latents are zero
-    # and also learn to replicate it when latents are different to zero.
-    def training_step(self, batch, batch_idx):
-        
-        split = "train"
-        metrics = self.split_step(batch)
-        metrics = {f'{split}_{k}': v for k,v in metrics.items()}
-        self.log_dict({k: v.item() for k, v in metrics.items()}, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
-        return metrics['train_loss'] # so lightning can train
-    
-
-    def get_metrics(self, data):
-        
-        metrics = dict()
-        loss = 0
-        if "same" ==  self.args.losses or "all" == self.args.losses:
-            same_loss = 1 - self.criterion(data['mid_reps'], data['rep_tgt']).mean()
-            loss += same_loss
-            metrics['same_loss'] = same_loss
-
-        if "class" == self.args.losses or "all" == self.args.losses:
-            class_loss = F.cross_entropy(data['logits'], data['class_tgt'], reduction="mean")
-            loss +=  class_loss
-            metrics['class_loss'] = class_loss
-
-            preds = data['logits'].argmax(dim=-1).view(-1)
-            correct = (preds == data['class_tgt']).view(-1).float()
-
-            accuracy = correct.sum()/correct.numel()
-            metrics['class_acc'] = accuracy
-            dtype=correct.dtype
-            device=correct.device
-            tasks = data['tasks'].view(-1)
-            n_attrs = 5 if self.args.dataset == "idsprites" else 6
-            #print(data['tasks'].shape,correct.shape)
-            sum_per_group = torch.zeros(n_attrs, dtype=dtype, device=device).scatter_reduce(0,
-                                                                                tasks,
-                                                                                correct,
-                                                                                reduce="sum")
-
-
-            counts = torch.zeros(n_attrs, dtype=tasks.dtype, device=device).scatter_reduce(0, tasks, torch.ones_like(tasks).cuda(), reduce="sum")
-            mean_per_group = sum_per_group/counts
-            if self.args.dataset == "idsprites":
-                task_names = ['shape','scale','orientation','x','y']
-            else:
-                task_names =['floor_hue', 'wall_hue', 'object_hue', 'scale', 'shape',
-                     'orientation']
-            for i, task in enumerate(task_names):
-                metrics[f'class_{task}'] = mean_per_group[i]
-            
-        metrics['loss'] = loss
-
-        #for k, v in metrics.items():
-        #    metrics[k] = v.item()
-        return metrics 
-
-    def split_step(self, batch):    
-
-        src_img, src_rep, imgs, gt_reps, latents = batch
-        zero_latents = torch.zeros_like(latents)
-        deltas = latents.sum(dim=-1)
-        bs, n_classes, c, h, w = imgs.shape
-        if self.args.encoder.arch == "cnn":
-            imgs = imgs.view(bs*n_classes, c, h, w)
-        src_rep = src_rep if self.use_reps else self.encoder(src_img.float())     # Image encoding
-        mid_reps = gt_reps if self.use_reps else self.encoder(imgs.float())     # Image encoding
-        if self.args.encoder.arch == "cnn":
-            mid_reps = mid_reps.view(bs, n_classes, -1)
-
-        src_rep = src_rep.unsqueeze(1).repeat((1,n_classes,1))
-        reps = self.modulator(src_rep, latents)                        # predicted reps given latents
-        reps = torch.nn.functional.normalize(reps, p=2.0, dim=1, eps=1e-12)
-        tgt_reps = self.modulator(mid_reps, zero_latents)               # reps we are trying to achieve
-        tgt_reps = torch.nn.functional.normalize(tgt_reps, p=2.0, dim=1, eps=1e-12)
-        logits = torch.matmul(reps, tgt_reps.transpose(1,2)).view(-1, n_classes) # bs x 10 x 10 --> 10bs x 10
-        data = dict()
-        data['mid_reps'] = mid_reps
-        data['rep_tgt'] = gt_reps
-        data['logits'] = logits
-        targets = torch.tensor(bs*list(range(n_classes))).view(-1, n_classes).to(logits.device)
-        tasks = latents.abs().argmax(dim=-1)
-        data['class_tgt'] = targets.view(-1)
-        data['tasks'] = tasks
-        metrics = self.get_metrics(data)
-
-        return metrics
-
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        split = "val"
-        metrics = self.split_step(batch)
-        metrics = {f'{split}_{k}': v for k,v in metrics.items()}
-        self.log_dict(metrics, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
-        return metrics['val_loss']
-        
-
-    def test_step(self, batch, batch_idx, dataloader_idx=0):
-        split = "test"
-        metrics = self.split_step(batch)
-        metrics = {f'{split}_{k}': v for k,v in metrics.items()}
-        self.log_dict(metrics, on_step=True, on_epoch=True, prog_bar=True, add_dataloader_idx=False)
-        return metrics['test_loss']
-
-    def configure_optimizers(self):
-        if self.encoder is None:
-            param_groups = [
-            {
-                'params': self.modulator.parameters()}
-            ]
-        else:
-            param_groups = [
-                {'params': self.encoder.parameters(),
-                 'params': self.modulator.parameters()}
-            ]
-        return torch.optim.AdamW(param_groups, lr=self.args.lr)
-
 def create_loggers(args):
     loggers = []
     try:
@@ -160,15 +33,6 @@ def create_loggers(args):
         print(e)
         pass
     
-    '''output_path = f"results/{args.dataset}"
-    csv_logger = CSVLogger(
-        output_path,
-        version = "v1",
-        name=args.experiment_id
-    )
-    csv_logger.log_hyperparams(args)
-    loggers.append(csv_logger)'''
-    
     return loggers
     
 def create_callbacks(args):
@@ -183,23 +47,6 @@ def create_callbacks(args):
                                  every_n_epochs=None,
                                  save_last=True))
     return callbacks
-
-
-def get_lightning_model(args):
-    encoder, modulator = create_model(args)
-    
-    if args.train_method == "encoder_erm":
-        model = LightningEncoderERM(args, encoder,modulator)
-    
-    elif args.train_method == "task_jepa":
-        model = LightningTaskJEPA(args, encoder, modulator)
-
-    elif args.train_method == "rep_train":
-        model = LightningRepClassification(args, encoder, modulator)
-    else:
-        pass
-        
-    return model
 
 def add_EMA_args(args):
     
@@ -222,6 +69,29 @@ def train(args):
     print("Creating model!", flush=True)
     model = get_lightning_model(args)
     print(model.modulator)
+    print(model.regressor)
+    
+
+    loss_dict = {'rep_train': ['class'], 
+                 'rep_train_plus': ['class', 'non_mod_reg','mod_reg'],
+                 'rep_train_same': ['same', 'non_mod_reg','mod_reg'],
+                 'rep_train_plus_res': ['class', 'non_mod_reg','mod_reg'],
+                 'rep_train_plus_film': ['class', 'non_mod_reg','mod_reg'],
+                 'rep_train_same_res': ['same', 'non_mod_reg','mod_reg'],
+                 'rep_train_same_film': ['same', 'non_mod_reg','mod_reg'],
+                 'rep_train_plus_trans': ['class', 'non_mod_reg','mod_reg'],
+                 'rep_train_same_trans': ['same', 'non_mod_reg','mod_reg'],
+                 'rep_train_same_linop': ['same', 'non_mod_reg','mod_reg'],
+                 'rep_train_same_latdir': ['same', 'non_mod_reg','mod_reg', "orth"],
+                 'non_mod_regression': ['non_mod_reg'],
+                 'mod_regression': ['non_mod_reg', 'mod_reg'],
+                 'mod_regression_trans': ['non_mod_reg', 'mod_reg'],
+                 'mod_regression_film': ['non_mod_reg', 'mod_reg'],
+                 'mod_regression_linop': ['non_mod_reg', 'mod_reg'],
+                 'mod_regression_latdir': ['non_mod_reg', 'mod_reg'],
+                 'regression': ['non_mod_reg']
+                 }
+    args.losses = loss_dict[args.train_method]
     ckpt_path = None
     if args.resume_id:
         ckpt_path = f"results/{args.dataset}/{args.experiment_id}/last.ckpt" if args.resume_id else None
@@ -230,10 +100,10 @@ def train(args):
     
     trainer = L.Trainer(accelerator="gpu",
                         devices=1,
-                        #max_epochs=args.num_epochs,
+                        enable_progress_bar=False,
                         check_val_every_n_epoch=None,
                         max_steps=args.num_steps,
-                        val_check_interval=args.num_steps//5,
+                        val_check_interval=50000,
                         callbacks=callbacks,
                         logger=loggers)
     trainer.fit(model=model,

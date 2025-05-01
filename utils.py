@@ -7,6 +7,15 @@ import pandas as pd
 import wandb
 from easydict import EasyDict as edict
 
+
+def update_dict(base_dict, new_dict):
+    for key, value in new_dict.items():
+        if key in base_dict:
+            base_dict[key] += value
+        else:
+            base_dict[key] = value
+    return base_dict
+
 def get_args(run_id, update_id=False):
     # Initialize the W&B API
     api = wandb.Api()

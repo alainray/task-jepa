@@ -12,18 +12,18 @@ os.environ["TORCH_HOME"] = "~/storage/cache"
 parser = argparse.ArgumentParser(description="Example of argparse usage")
 # Add arguments
 parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs to train')
-parser.add_argument('--num_steps', type=int, default=400000, help='Number of iterations to train')
-parser.add_argument('--dataset', type=str, default="shapes3d", help='Dataset')
-parser.add_argument('--train_method', type=str, choices=['erm','task_jepa',"pair_erm","encoder_erm","rep_train"], default="erm", help='Training Method')
+parser.add_argument('--num_steps', type=int, default=100000, help='Number of iterations to train')
+parser.add_argument('--dataset', type=str, default="3dshapes", help='Dataset')
+parser.add_argument('--train_method', type=str, default="rep_train", help='Training Method')
+parser.add_argument("--lambda_latent_loss", type=float, default=1.0, help="Factor for Latent Regression Loss")
 parser.add_argument('--pretrain_method', type=str, default=None, help='PreTraining Method')
-parser.add_argument('--train_bs', type=int, default=400000, help='Batch size for training')
+parser.add_argument('--train_bs', type=int, default=256, help='Batch size for training')
 parser.add_argument('--frozen', action="store_true", help='Encoder is frozen or not')
 parser.add_argument('--resume_id', type=str, default=None, help='Resume Experiment Id')
-parser.add_argument('--losses', type=str, default="all", help='Which losses to use when rep training') # same/latent/all
 parser.add_argument('--experiment_id', type=str, default=None, help='Experiment id to resume run')
-parser.add_argument('--pretrained_id', type=str, default=None, help='Experiment id associated with checkpoint')
-parser.add_argument('--pretrained_epoch', type=int, default=50, help='Which epoch the checkpoint belongs to')
-parser.add_argument('--pretrained_model', action="store_true", help='Resume Experiment or not')
+parser.add_argument('--pretrained_encoder', type=str, default=None, help='Experiment id associated with encoder to load')
+#parser.add_argument('--pretrained_epoch', type=int, default=50, help='Which epoch the checkpoint belongs to')
+#parser.add_argument('--pretrained_model', action="store_true", help='Resume Experiment or not')
 parser.add_argument('--pretrained_reps', type=str, default=None, help='Target for rep_train method')
 parser.add_argument('--arch', type=str, default="vit", help='Encoder Architecture')
 parser.add_argument('--mod_arch', type=str, default="mlp", help='Encoder Architecture')
@@ -39,7 +39,8 @@ parser.add_argument("--iters_per_ema", type=float, default=1.0, help="How many i
 parser.add_argument("--wd", type=float, default=0.04, help="Reference Weight Decay")
 parser.add_argument("--final_wd", type=float, default=0.4, help="Final Weight Decay for scheduler")
 parser.add_argument("--ipe_scale", type=float, default=1.0, help="Scale factor for iterations per epoch")
-
+parser.add_argument("--make_random_batches", action="store_true", help='Make batches fully random vs deltas of size 1')
+parser.add_argument("--unnormalized_modulator", action="store_true", help='Modulator not normalized')
 
 # Parse the arguments
 parsed_args = parser.parse_args()
@@ -53,11 +54,9 @@ args.sub_dataset = int(args.dataset.split("_")[1]) if "idsprites" in args.datase
 args.dataset = args.dataset.split("_")[0]
 args.test = False
 args.encoder = {
-    'pretrained': args.pretrained_model,
+    'pretrained': args.pretrained_encoder,
    # 'output_dim': 384, # vit_b_16: 784, vit_b_32: 784 # vit: 384.
-    'id': args.pretrained_id,
     "enc_dims": args.enc_dims,
-    'epoch': args.pretrained_epoch,
     'arch': args.arch,
     'frozen': args.frozen,
     'pretrain_method': args.pretrain_method}
@@ -66,7 +65,7 @@ args.modulator = {'arch': args.mod_arch, 'hidden_dim': args.mod_dims}
 args.pretrained_arch = args.encoder['arch'] if args.encoder['pretrained'] and args.encoder['frozen'] else None
 args.data_dir = "idsprites" if args.dataset == "idsprites" else f"/mnt/nas2/GrimaRepo/araymond"  
 args.pretrained_feats = False
-args.experiment_id = None 
+#args.experiment_id = None 
 args.save_weights = not args.test
 args.save_metrics = not args.test
 args.save_every = 10
@@ -84,14 +83,17 @@ METRICS_PER_METHOD = {
 FOVS = {"3dshapes": {'floor_hue': 10, 'wall_hue': 10, 'object_hue': 10, 
                           'scale': 8, 'shape': 4, 'orientation': 15},
         "idsprites": {'shape': 10, 'scale': 10, 'orientation': 10, 
-                          'x': 8, 'y': 4}
+                          'x': 8, 'y': 4},
+        "mpi3d": {'object_color':6,'object_shape':6,'object_size':2,'camera_height':3,'background_color':3,'h_axis':40,'v_axis':40}
        }
-FOVS_PER_DATASET = {'3dshapes': ["floor_hue", "wall_hue", "object_hue", "scale", "shape", "orientation"],
-                   'idsprites': ["shape","scale","orientation","x","y"]
+FOVS_PER_DATASET = {'3dshapes': ['floor_hue','wall_hue','object_hue','scale','shape', 'orientation'],
+                   'idsprites': ["shape","scale","orientation","x","y"],
+                   "mpi3d": ['object_color','object_shape','object_size','camera_height','background_color','h_axis','v_axis']
                    }
+args.FOVS_PER_DATASET = FOVS_PER_DATASET[args.dataset]
 #FOVS_PER_DATASET = {'shapes3d': ["floor_hue", "wall_hue", "scale", "shape", "orientation"]}
 
-args.metrics = METRICS_PER_METHOD[args.train_method]
+#args.metrics = METRICS_PER_METHOD[args.train_method]
 args.fovs =  FOVS_PER_DATASET[args.dataset]
 # Defines which tasks to optimize for when training under EncoderERM
 args.fovs_tasks = args.fovs # ["floor_hue", "wall_hue", "object_hue", "scale", "shape", "orientation"]
